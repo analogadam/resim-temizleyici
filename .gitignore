@@ -1,0 +1,7 @@
+# Bu klasörde başka scriptler de var; sadece Resim Temizleyici dosyaları takip edilir
+*
+!.gitignore
+!ResimTemizleyici.py
+!ResimTemizleyici.spec
+!requirements.txt
+!README.md
