@@ -3,11 +3,13 @@ import re
 import sys
 import io
 import ctypes
+import hashlib
 import subprocess
 import threading
 import shutil
 import tkinter as tk
 from ctypes import wintypes
+from dataclasses import dataclass
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image
 import imagehash
@@ -17,9 +19,11 @@ if sys.platform.startswith("win"):
     if sys.stdout is not None:
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
+SURUM = "1.2.0"
 RESIM_UZANTILARI = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
 # Windows'un kopya adlandırmaları: "x - Kopya.jpg", "x - Copy.jpg", "x (1).jpg"
 KOPYA_ADI = re.compile(r"kopya|copy|\(\d+\)", re.IGNORECASE)
+YUKLENIYOR = "yükleniyor..."
 
 
 # --- DOSYA İŞLEMLERİ (arayüzden bağımsız) ---
@@ -57,6 +61,14 @@ def benzersiz_yol(klasor, ad):
     return aday
 
 
+def dosya_ozeti(yol):
+    h = hashlib.sha256()
+    with open(yol, "rb") as f:
+        for parca in iter(lambda: f.read(1 << 20), b""):
+            h.update(parca)
+    return h.hexdigest()
+
+
 def format_bytes(size):
     for unit in ["B", "KB", "MB", "GB", "TB"]:
         if size < 1024.0: return f"{size:.2f} {unit}"
@@ -69,14 +81,73 @@ def hata_ozeti(hatalar):
     return f"{len(hatalar)} dosyada işlem yapılamadı:\n\n{ilk}{kalan}"
 
 
+def konumu_goster(yol):
+    if os.path.exists(yol):
+        subprocess.run(["explorer", "/select,", os.path.normpath(yol)])
+
+
+def dosyayi_ac(yol):
+    try: os.startfile(yol)
+    except OSError as e: messagebox.showerror("Hata", f"Dosya açılamadı: {e}")
+
+
+# --- KOPYA BULMA MANTIĞI (arayüzden bağımsız) ---
+@dataclass
+class Resim:
+    yol: str
+    boyut: int
+    genislik: int
+    yukseklik: int
+    tarih: float
+    ozet: str = ""  # sha256; yalnız kopya grubundaki dosyalar için hesaplanır
+
+    @property
+    def ad(self): return os.path.basename(self.yol)
+
+    @property
+    def cozunurluk(self): return f"{self.genislik}x{self.yukseklik}"
+
+
+def asil_onceligi(r):
+    """Küçük olan ASIL olur: adında 'kopya' geçmeyen, çözünürlüğü yüksek, en eski dosya."""
+    return (bool(KOPYA_ADI.search(r.ad)), -(r.genislik * r.yukseklik), r.tarih)
+
+
+def kopya_gruplarini_bul(klasor, iptal_mi, ilerleme):
+    """Görsel olarak aynı resimleri (perceptual hash) gruplar; her grubun ilk elemanı ASIL adayıdır."""
+    yollar = [os.path.join(r, f) for r, _, dosyalar in os.walk(klasor) for f in dosyalar if f.lower().endswith(RESIM_UZANTILARI)]
+    hashler, okunamayan = {}, 0
+    for i, yol in enumerate(yollar):
+        if iptal_mi(): break
+        ilerleme(i, len(yollar))
+        try:
+            with Image.open(yol) as img:
+                genislik, yukseklik = img.size
+                img.draft("RGB", (64, 64))  # JPEG'i küçük çözer; phash zaten 32x32'ye indiriyor
+                h = str(imagehash.phash(img))
+            st = os.stat(yol)
+            hashler.setdefault(h, []).append(Resim(yol, st.st_size, genislik, yukseklik, min(st.st_mtime, st.st_ctime)))
+        except Exception:
+            okunamayan += 1
+
+    gruplar = [sorted(l, key=asil_onceligi) for l in hashler.values() if len(l) > 1]
+    for grup in gruplar:
+        for r in grup:
+            try: r.ozet = dosya_ozeti(r.yol)
+            except OSError: pass
+    return gruplar, len(yollar), okunamayan
+
+
 class KopyaUygulamasi:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Gelişmiş Depo Yöneticisi & Dosya Gezgini")
+        self.root.title(f"Gelişmiş Depo Yöneticisi & Dosya Gezgini — v{SURUM}")
         self.root.geometry("1300x850")
 
         self.iptal_kopya = False
         self.iptal_boyut = False
+        self.resimler = {}  # yol -> Resim (tree1'deki satırlar)
+        self.tarama_bilgisi = ""
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True)
@@ -94,6 +165,19 @@ class KopyaUygulamasi:
         """tkinter thread-safe değil; arka plan thread'leri arayüze bu yolla dokunur."""
         self.root.after(0, fonksiyon, *args)
 
+    def sag_tik_bagla(self, tree, menu):
+        def goster(event):
+            satir = tree.identify_row(event.y)
+            if not satir: return
+            if satir not in tree.selection(): tree.selection_set(satir)
+            tree.focus(satir)
+            menu.tk_popup(event.x_root, event.y_root)
+        tree.bind("<Button-3>", goster)
+
+    def durdur_sinyali(self, hedef):
+        if hedef == "kopya": self.iptal_kopya = True
+        else: self.iptal_boyut = True
+
     # --- SEKME 2: KLASÖR BOYUT ANALİZİ ---
     def arayuz_boyut_analizoru(self):
         ust = tk.Frame(self.tab2, pady=15, bg="#f8f9fa")
@@ -106,16 +190,16 @@ class KopyaUygulamasi:
         self.iptal_btn2.pack(side="left")
 
         # Sağ taraftaki işlem butonları
-        tk.Button(ust, text="🗑️ Seçileni Sil", command=self.analiz_sil, bg="#f44336", fg="white", padx=15).pack(side="right", padx=10)
-        tk.Button(ust, text="📂 Klasörü Göster", command=self.analiz_goster, bg="#6c757d", fg="white", padx=15).pack(side="right", padx=10)
+        tk.Button(ust, text="🗑️ Seçilenleri Sil", command=self.analiz_sil, bg="#f44336", fg="white", padx=15).pack(side="right", padx=10)
+        tk.Button(ust, text="📂 Konumu Göster", command=lambda: konumu_goster(self.analiz_odak_yolu()), bg="#6c757d", fg="white", padx=15).pack(side="right", padx=10)
 
         self.progress2 = ttk.Progressbar(self.tab2, orient="horizontal", mode="indeterminate")
         self.progress2.pack(fill="x", padx=20, pady=10)
 
-        self.analiz_etiket = tk.Label(self.tab2, text="💡 Silinen öğeler Geri Dönüşüm Kutusu'na gider.", fg="gray")
+        self.analiz_etiket = tk.Label(self.tab2, text="💡 Sağ tıkla menü açılır, Ctrl+A ile hepsi seçilir. Silinenler Geri Dönüşüm Kutusu'na gider.", fg="gray")
         self.analiz_etiket.pack()
 
-        self.tree2 = ttk.Treeview(self.tab2, columns=("Boyut", "Yuzde", "TamYol"), show="tree headings")
+        self.tree2 = ttk.Treeview(self.tab2, columns=("Boyut", "Yuzde", "TamYol"), show="tree headings", selectmode="extended")
         self.tree2.heading("#0", text="Dosya / Klasör Yapısı", anchor="w")
         self.tree2.heading("Boyut", text="Boyut")
         self.tree2.heading("Yuzde", text="Doluluk")
@@ -131,26 +215,43 @@ class KopyaUygulamasi:
         sb.pack(side="right", fill="y", padx=(0, 20), pady=10)
 
         self.tree2.bind("<<TreeviewOpen>>", self.klasor_genislet)
+        self.tree2.bind("<Control-a>", lambda e: self.tree2.selection_set(self.tree2.get_children()) or "break")
 
-    def analiz_goster(self):
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="▶ Aç", command=lambda: dosyayi_ac(self.analiz_odak_yolu()))
+        menu.add_command(label="📂 Konumu Göster", command=lambda: konumu_goster(self.analiz_odak_yolu()))
+        menu.add_separator()
+        menu.add_command(label="🗑️ Seçilenleri Sil", command=self.analiz_sil, foreground="red")
+        self.sag_tik_bagla(self.tree2, menu)
+
+    def analiz_odak_yolu(self):
         item_id = self.tree2.focus()
-        if not item_id: return
-        yol = self.tree2.item(item_id)["values"][2]
-        if os.path.exists(yol):
-            subprocess.run(["explorer", "/select,", os.path.normpath(yol)])
+        return self.tree2.set(item_id, "TamYol") if item_id else ""
+
+    def analiz_secilenleri(self):
+        """Seçili öğeler; üst klasörü de seçili olanlar zaten onunla gideceği için atlanır."""
+        secili = set(self.tree2.selection())
+        def ustu_secili(iid):
+            ust = self.tree2.parent(iid)
+            while ust:
+                if ust in secili: return True
+                ust = self.tree2.parent(ust)
+            return False
+        return [i for i in self.tree2.selection() if self.tree2.set(i, "TamYol") and not ustu_secili(i)]
 
     def analiz_sil(self):
-        item_id = self.tree2.focus()
-        if not item_id: return
-        yol = self.tree2.item(item_id)["values"][2]
-        ad = self.tree2.item(item_id)["text"]
-
-        if messagebox.askyesno("Silme Onayı", f"'{ad.strip()}' (varsa altındakilerle birlikte) Geri Dönüşüm Kutusu'na gönderilsin mi?"):
+        secili = self.analiz_secilenleri()
+        if not secili: return
+        ne = f"'{self.tree2.item(secili[0], 'text').strip()}'" if len(secili) == 1 else f"{len(secili)} öğe"
+        if not messagebox.askyesno("Silme Onayı", f"{ne} (varsa altındakilerle birlikte) Geri Dönüşüm Kutusu'na gönderilsin mi?"): return
+        hatalar = []
+        for iid in secili:
+            yol = self.tree2.set(iid, "TamYol")
             try:
                 geri_donusume_gonder(yol)
-                self.tree2.delete(item_id)
-            except Exception as e:
-                messagebox.showerror("Hata", f"Silme işlemi başarısız: {e}")
+                self.tree2.delete(iid)
+            except Exception as e: hatalar.append((yol, e))
+        if hatalar: messagebox.showwarning("Bazı öğeler silinemedi", hata_ozeti(hatalar))
 
     def boyut_analizi_thread(self):
         secilen = filedialog.askdirectory()
@@ -181,7 +282,7 @@ class KopyaUygulamasi:
             oran = (i["boyut"] / ana_toplam * 100) if ana_toplam > 0 else 0
             node = self.tree2.insert(parent_id, "end", text=f" {i['ad']}", values=(format_bytes(i["boyut"]), f"%{oran:.1f}", i["yol"]), open=False)
             if i["is_dir"]:
-                self.tree2.insert(node, "end", text="yükleniyor...")
+                self.tree2.insert(node, "end", text=YUKLENIYOR)
 
         self.analiz_etiket.config(text=f"✅ Klasör: {os.path.basename(yol)} | Toplam: {format_bytes(ana_toplam)}", fg="green")
         self.progress2.stop()
@@ -191,9 +292,9 @@ class KopyaUygulamasi:
     def klasor_genislet(self, event):
         item_id = self.tree2.focus()
         cocuklar = self.tree2.get_children(item_id)
-        if len(cocuklar) == 1 and self.tree2.item(cocuklar[0])["text"] == "yükleniyor...":
+        if len(cocuklar) == 1 and self.tree2.item(cocuklar[0])["text"] == YUKLENIYOR:
             self.tree2.delete(cocuklar[0])
-            tam_yol = self.tree2.item(item_id)["values"][2]
+            tam_yol = self.tree2.set(item_id, "TamYol")
             self.progress2.start()
             threading.Thread(target=self.boyut_hesapla, args=(tam_yol, item_id), daemon=True).start()
 
@@ -209,10 +310,6 @@ class KopyaUygulamasi:
         except OSError: pass
         return t
 
-    def durdur_sinyali(self, hedef):
-        if hedef == "kopya": self.iptal_kopya = True
-        else: self.iptal_boyut = True
-
     # --- SEKME 1: KOPYA RESİM AVCISI ---
     # tree1 satırlarının iid'si dosyanın tam yoludur.
     def arayuz_kopya_bulucu(self):
@@ -224,103 +321,149 @@ class KopyaUygulamasi:
         self.iptal_btn1.pack(side="left")
         self.progress1 = ttk.Progressbar(self.tab1, orient="horizontal", mode="determinate")
         self.progress1.pack(fill="x", padx=20, pady=10)
-        self.kopya_etiket = tk.Label(self.tab1, text="💡 Çift tıklayarak resmi açabilirsiniz. Silinmesini istemediğiniz kopyayı seçip 'Listeden Çıkar' deyin.", fg="gray")
+        self.kopya_etiket = tk.Label(self.tab1, text="💡 Çift tıkla resmi açar, sağ tık menüsünden ASIL seçimini değiştirebilirsiniz. 'Eşleşme: Benzer' olanlara silmeden önce bakın.", fg="gray")
         self.kopya_etiket.pack()
 
         liste = tk.Frame(self.tab1)
         liste.pack(fill="both", expand=True, padx=20)
-        self.tree1 = ttk.Treeview(liste, columns=("Grup", "Durum", "Dosya", "Boyut", "Konum"), show="headings")
-        for col in self.tree1["columns"]: self.tree1.heading(col, text=col)
+        sutunlar = {"Grup": 60, "Durum": 70, "Dosya": 260, "Çözünürlük": 100, "Boyut": 90, "Eşleşme": 90, "Konum": 500}
+        self.tree1 = ttk.Treeview(liste, columns=tuple(sutunlar), show="headings", selectmode="extended")
+        for col, genislik in sutunlar.items():
+            self.tree1.heading(col, text=col)
+            self.tree1.column(col, width=genislik, anchor="w" if col in ("Dosya", "Konum") else "center")
         sb = ttk.Scrollbar(liste, orient="vertical", command=self.tree1.yview)
         self.tree1.configure(yscrollcommand=sb.set)
         self.tree1.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
         self.tree1.tag_configure("asil", background="#d1e7dd"); self.tree1.tag_configure("kopya", background="#f8d7da")
-        self.tree1.bind("<Double-1>", self.resmi_ac)
+        self.tree1.bind("<Double-1>", lambda e: self.tree1.identify_row(e.y) and dosyayi_ac(self.tree1.identify_row(e.y)))
+        self.tree1.bind("<Control-a>", lambda e: self.tree1.selection_set(self.tree1.get_children()) or "break")
+
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="▶ Resmi Aç", command=lambda: dosyayi_ac(self.tree1.focus()))
+        menu.add_command(label="📂 Konumu Göster", command=lambda: konumu_goster(self.tree1.focus()))
+        menu.add_command(label="⭐ ASIL Yap", command=self.asil_yap)
+        menu.add_separator()
+        menu.add_command(label="➖ Listeden Çıkar", command=self.listeden_cikar)
+        menu.add_command(label="🚚 Seçilenleri Taşı", command=lambda: self.dosyalari_tasi(self.tree1.selection()))
+        menu.add_command(label="🗑️ Seçilenleri Sil", command=lambda: self.dosyalari_sil(self.tree1.selection()), foreground="red")
+        self.sag_tik_bagla(self.tree1, menu)
 
         alt = tk.Frame(self.tab1, pady=10)
         alt.pack(fill="x")
-        tk.Button(alt, text="🚚 Kopyaları Taşı", command=self.tum_kopyalari_tasi, bg="#9C27B0", fg="white", padx=15).pack(side="right", padx=10)
-        tk.Button(alt, text="🗑️ Kopyaları Sil", command=self.tum_kopyalari_sil, bg="#f44336", fg="white", padx=15).pack(side="right", padx=10)
+        tk.Button(alt, text="🚚 Tüm Kopyaları Taşı", command=lambda: self.dosyalari_tasi(self.kopya_satirlari()), bg="#9C27B0", fg="white", padx=15).pack(side="right", padx=10)
+        tk.Button(alt, text="🗑️ Tüm Kopyaları Sil", command=lambda: self.dosyalari_sil(self.kopya_satirlari()), bg="#f44336", fg="white", padx=15).pack(side="right", padx=10)
         tk.Button(alt, text="➖ Seçileni Listeden Çıkar", command=self.listeden_cikar, bg="#6c757d", fg="white", padx=15).pack(side="left", padx=20)
-
-    def resmi_ac(self, event):
-        yol = self.tree1.identify_row(event.y)
-        if yol and os.path.exists(yol):
-            os.startfile(yol)
-
-    def listeden_cikar(self):
-        for iid in self.tree1.selection():
-            self.tree1.delete(iid)
 
     def taramayı_baslat_thread(self):
         secilen = filedialog.askdirectory()
         if not secilen: return
         self.iptal_kopya = False
         self.tree1.delete(*self.tree1.get_children())
+        self.resimler.clear()
+        self.kopya_etiket.config(text="⏳ Resimler taranıyor...", fg="blue")
         self.tara_btn1.config(state="disabled")
         self.iptal_btn1.config(state="normal")
         threading.Thread(target=self.tara_mantigi, args=(secilen,), daemon=True).start()
 
     def tara_mantigi(self, yol):
-        """Arka plan thread'i: resimleri hash'ler, kopya gruplarını arayüze bırakır."""
-        bulunanlar = [os.path.join(r, f) for r, d, files in os.walk(yol) for f in files if f.lower().endswith(RESIM_UZANTILARI)]
-        self.arayuzde(self.progress1.configure, {"maximum": max(len(bulunanlar), 1), "value": 0})
-        hashes, okunamayan = {}, 0
-        for i, f_yol in enumerate(bulunanlar):
-            if self.iptal_kopya: break
-            if i % 20 == 0: self.arayuzde(self.progress1.configure, {"value": i})
-            try:
-                with Image.open(f_yol) as img: h = str(imagehash.phash(img))
-                stat = os.stat(f_yol)
-                ad = os.path.basename(f_yol)
-                info = {"yol": f_yol, "ad": ad, "boyut": f"{stat.st_size / 1048576:.2f} MB", "klasor": os.path.dirname(f_yol), "tarih": min(stat.st_mtime, stat.st_ctime), "is_copy": bool(KOPYA_ADI.search(ad))}
-                hashes.setdefault(h, []).append(info)
-            except Exception:
-                okunamayan += 1
-        gruplar = [l for l in hashes.values() if len(l) > 1]
-        for l in gruplar: l.sort(key=lambda x: (x["is_copy"], x["tarih"]))
-        self.arayuzde(self.kopyalari_goster, gruplar, len(bulunanlar), okunamayan)
+        """Arka plan thread'i: kopya gruplarını bulur, sonucu arayüze bırakır."""
+        def ilerleme(i, toplam):
+            if i % 20 == 0: self.arayuzde(self.progress1.configure, {"maximum": max(toplam, 1), "value": i})
+        sonuc = kopya_gruplarini_bul(yol, lambda: self.iptal_kopya, ilerleme)
+        self.arayuzde(self.kopyalari_goster, *sonuc)
 
     def kopyalari_goster(self, gruplar, taranan, okunamayan):
-        for g_id, l in enumerate(gruplar, start=1):
-            for idx, d in enumerate(l):
-                asil = idx == 0
-                self.tree1.insert("", "end", iid=d["yol"], values=(f"#{g_id}", "ASIL" if asil else "KOPYA", d["ad"], d["boyut"], d["klasor"]), tags="asil" if asil else "kopya")
-        kopya_sayisi = sum(len(l) - 1 for l in gruplar)
+        for g_id, grup in enumerate(gruplar, start=1):
+            for idx, r in enumerate(grup):
+                self.resimler[r.yol] = r
+                self.tree1.insert("", "end", iid=r.yol, values=(f"#{g_id}", "ASIL" if idx == 0 else "KOPYA", r.ad, r.cozunurluk, format_bytes(r.boyut), "", os.path.dirname(r.yol)))
+            self.grubu_boya(f"#{g_id}")
         durum = "⏹️ Durduruldu" if self.iptal_kopya else "✅ Bitti"
-        ek = f" | {okunamayan} dosya okunamadı" if okunamayan else ""
-        self.kopya_etiket.config(text=f"{durum}: {taranan} resim, {len(gruplar)} grup, {kopya_sayisi} kopya{ek}", fg="green")
+        ek = f", {okunamayan} okunamadı" if okunamayan else ""
+        self.tarama_bilgisi = f"{durum}: {taranan} resim tarandı{ek}"
+        self.ozet_guncelle()
         self.progress1.configure(value=self.progress1["maximum"])
         self.tara_btn1.config(state="normal"); self.iptal_btn1.config(state="disabled")
 
+    # --- GRUP YÖNETİMİ ---
+    def grup_satirlari(self, grup):
+        return [i for i in self.tree1.get_children() if self.tree1.set(i, "Grup") == grup]
+
     def kopya_satirlari(self):
-        return [i for i in self.tree1.get_children() if self.tree1.item(i)["values"][1] == "KOPYA"]
+        return [i for i in self.tree1.get_children() if self.tree1.set(i, "Durum") == "KOPYA"]
 
-    def tum_kopyalari_sil(self):
-        items = self.kopya_satirlari()
-        if not items: return
-        if not messagebox.askyesno("Onay", f"{len(items)} kopya Geri Dönüşüm Kutusu'na gönderilsin mi?"): return
-        hatalar = []
-        for yol in items:
-            try:
-                geri_donusume_gonder(yol)
-                self.tree1.delete(yol)
-            except Exception as e: hatalar.append((yol, e))
-        if hatalar: messagebox.showwarning("Bazı dosyalar silinemedi", hata_ozeti(hatalar))
+    def grubu_boya(self, grup):
+        """Renkleri ve ASIL'e göre 'Eşleşme' sütununu günceller."""
+        satirlar = self.grup_satirlari(grup)
+        asil = next(i for i in satirlar if self.tree1.set(i, "Durum") == "ASIL")
+        for i in satirlar:
+            if i == asil:
+                self.tree1.set(i, "Eşleşme", "—"); self.tree1.item(i, tags="asil")
+            else:
+                ayni = self.resimler[i].ozet and self.resimler[i].ozet == self.resimler[asil].ozet
+                self.tree1.set(i, "Eşleşme", "Birebir" if ayni else "Benzer"); self.tree1.item(i, tags="kopya")
 
-    def tum_kopyalari_tasi(self):
-        items = self.kopya_satirlari()
-        if not items: return
-        hedef = filedialog.askdirectory(title="Kopyalar hangi klasöre taşınsın?")
+    def grubu_duzenle(self, grup):
+        """Satır silindikten sonra: tek kalan grup listeden düşer, ASIL'siz kalan gruba yeni ASIL atanır."""
+        satirlar = self.grup_satirlari(grup)
+        if len(satirlar) < 2:
+            for i in satirlar:
+                self.tree1.delete(i); self.resimler.pop(i, None)
+            return
+        if not any(self.tree1.set(i, "Durum") == "ASIL" for i in satirlar):
+            yeni = min(satirlar, key=lambda i: asil_onceligi(self.resimler[i]))
+            self.tree1.set(yeni, "Durum", "ASIL")
+        self.grubu_boya(grup)
+
+    def satirlari_kaldir(self, yollar):
+        gruplar = {self.tree1.set(y, "Grup") for y in yollar}
+        for y in yollar:
+            self.tree1.delete(y); self.resimler.pop(y, None)
+        for g in gruplar: self.grubu_duzenle(g)
+        self.ozet_guncelle()
+
+    def ozet_guncelle(self):
+        kopyalar = self.kopya_satirlari()
+        grup_sayisi = len({self.tree1.set(i, "Grup") for i in self.tree1.get_children()})
+        kazanc = sum(self.resimler[y].boyut for y in kopyalar)
+        self.kopya_etiket.config(text=f"{self.tarama_bilgisi} | {grup_sayisi} grup, {len(kopyalar)} kopya | Kopyalar silinirse açılacak alan: {format_bytes(kazanc)}", fg="green")
+
+    def asil_yap(self):
+        secili = self.tree1.selection()
+        if len(secili) != 1:
+            messagebox.showinfo("ASIL Yap", "ASIL yapmak için tek bir satır seçin."); return
+        grup = self.tree1.set(secili[0], "Grup")
+        for i in self.grup_satirlari(grup): self.tree1.set(i, "Durum", "KOPYA")
+        self.tree1.set(secili[0], "Durum", "ASIL")
+        self.grubu_boya(grup)
+        self.ozet_guncelle()
+
+    def listeden_cikar(self):
+        self.satirlari_kaldir(self.tree1.selection())
+
+    # --- DOSYA İŞLEMLERİ ---
+    def dosyalari_sil(self, yollar):
+        if not yollar: return
+        asil = sum(1 for y in yollar if self.tree1.set(y, "Durum") == "ASIL")
+        uyari = f"\n\n⚠️ Bunların {asil} tanesi ASIL dosya!" if asil else ""
+        if not messagebox.askyesno("Onay", f"{len(yollar)} dosya Geri Dönüşüm Kutusu'na gönderilsin mi?{uyari}"): return
+        self.toplu_islem(yollar, geri_donusume_gonder, "Bazı dosyalar silinemedi")
+
+    def dosyalari_tasi(self, yollar):
+        if not yollar: return
+        hedef = filedialog.askdirectory(title=f"{len(yollar)} dosya hangi klasöre taşınsın?")
         if not hedef: return
-        hatalar = []
-        for yol in items:
+        self.toplu_islem(yollar, lambda y: shutil.move(y, benzersiz_yol(hedef, os.path.basename(y))), "Bazı dosyalar taşınamadı")
+
+    def toplu_islem(self, yollar, islem, hata_basligi):
+        basarili, hatalar = [], []
+        for yol in yollar:
             try:
-                shutil.move(yol, benzersiz_yol(hedef, os.path.basename(yol)))
-                self.tree1.delete(yol)
+                islem(yol); basarili.append(yol)
             except Exception as e: hatalar.append((yol, e))
-        if hatalar: messagebox.showwarning("Bazı dosyalar taşınamadı", hata_ozeti(hatalar))
+        self.satirlari_kaldir(basarili)
+        if hatalar: messagebox.showwarning(hata_basligi, hata_ozeti(hatalar))
 
 
 if __name__ == "__main__":
